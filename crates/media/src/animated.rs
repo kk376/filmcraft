@@ -245,6 +245,11 @@ impl AnimatedSource {
         self.starts.partition_point(|s| *s <= t).saturating_sub(1)
     }
 
+    /// Unique cache identifier for this source.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
     /// Whether frame `i` is in the cache right now.
     pub fn is_cached(&self, i: usize) -> bool {
         self.cache.get(&(self.id, i)).is_some()
