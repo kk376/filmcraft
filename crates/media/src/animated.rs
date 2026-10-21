@@ -158,11 +158,14 @@ pub fn from_bytes_with_cache(name: &str, bytes: Arc<[u8]>, cache: Arc<FrameCache
 
 impl AnimatedSource {
     fn from_frames(name: &str, format: Format, bytes: Arc<[u8]>, frames: Frames<'_>, cache: Arc<FrameCache<(u64, usize)>>) -> Option<Self> {
-        let mut pictures: Vec<(u32, u32, Vec<u8>)> = Vec::new();
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let mut last_picture: Option<(u32, u32, Vec<u8>)> = None;
         let mut durations: Vec<Tick> = Vec::new();
         let mut raw_indices: Vec<usize> = Vec::new();
         let mut decoded = 0usize;
         let mut has_alpha = false;
+        let mut first_dim: Option<(u32, u32)> = None;
+        let mut count = 0usize;
         for (raw_idx, frame) in frames.take(MAX_FRAMES).enumerate() {
             // a damaged frame ends the animation at the frames before it
             let Ok(frame) = frame else { break };
@@ -170,7 +173,7 @@ impl AnimatedSource {
             let buffer = frame.into_buffer();
             let (w, h) = buffer.dimensions();
             let rgba = buffer.into_raw();
-            if let (Some(last), Some(d)) = (pictures.last(), durations.last_mut())
+            if let (Some(last), Some(d)) = (&last_picture, durations.last_mut())
                 && (last.0, last.1) == (w, h)
                 && last.2 == rgba
             {
@@ -182,14 +185,20 @@ impl AnimatedSource {
                 break;
             }
             has_alpha = has_alpha || rgba.as_chunks::<4>().0.iter().any(|p| p[3] < 255);
-            pictures.push((w, h, rgba));
+            if first_dim.is_none() {
+                first_dim = Some((w, h));
+            }
+            cache.insert((id, count), Arc::new(VideoFrame::rgba8(w, h, rgba.clone())));
             durations.push(ticks);
             raw_indices.push(raw_idx);
+            count += 1;
+            last_picture = Some((w, h, rgba));
         }
-        if pictures.len() < 2 {
+        if count < 2 {
+            cache.retain(|&(k_id, _)| k_id != id);
             return None;
         }
-        let (width, height) = pictures.first().map(|p| (p.0, p.1))?;
+        let (width, height) = first_dim?;
         let mut starts = Vec::with_capacity(durations.len());
         let mut t = Tick::ZERO;
         for d in &durations {
@@ -218,10 +227,6 @@ impl AnimatedSource {
             start_timecode: None,
             file_size: Some(file_size),
         };
-        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        for (i, (w, h, rgba)) in pictures.into_iter().enumerate() {
-            cache.insert((id, i), Arc::new(VideoFrame::rgba8(w, h, rgba)));
-        }
         Some(Self { info, starts, id, format, bytes, raw_indices, cache })
     }
 
