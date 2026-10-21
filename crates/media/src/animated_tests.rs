@@ -174,3 +174,33 @@ fn clip_rate_follows_the_common_frame_length() {
     assert_eq!(rate_of(&[ms(5_000), ms(5_000)]), FrameRate::FPS_30, "0.2 fps is not a video rate");
     assert_eq!(rate_of(&[]), FrameRate::FPS_30);
 }
+
+/// #2474: animated image sources share a bounded cache; frames past the budget are evicted and
+/// decoded again on demand from the file, and dropping the source frees all its frames from the cache.
+#[test]
+fn animated_sources_share_a_bounded_cache_and_decode_again_after_eviction() {
+    let frame_bytes = (W * H * 4) as usize;
+    // Budget fits 2 frames (64 bytes); 3rd frame will trigger eviction
+    let cache = Arc::new(FrameCache::new(frame_bytes * 2 + frame_bytes / 2));
+
+    let f0 = picture([10, 20, 30], 255);
+    let f1 = picture([40, 50, 60], 255);
+    let f2 = picture([70, 80, 90], 255);
+
+    let bytes = Arc::from(apng(&[(f0.clone(), (1, 10)), (f1.clone(), (1, 10)), (f2.clone(), (1, 10))]));
+    let s = from_bytes_with_cache("bounded.png", bytes, cache.clone()).expect("animated").expect("opens");
+
+    assert_eq!(s.frame_count(), 3);
+    // At open, 3 frames were inserted; eviction target brought cache down to 2 frames
+    // So frame 0 was evicted, frames 1 and 2 remain cached
+    assert!(!s.is_cached(0), "frame 0 evicted under memory budget");
+    assert!(s.is_cached(1) && s.is_cached(2));
+
+    // Requesting evicted frame 0 decodes again on demand
+    assert_eq!(pixels(&s, Tick::ZERO), f0);
+    assert!(s.is_cached(0), "frame 0 recached on demand");
+
+    // Dropping the source removes all its entries from the cache
+    drop(s);
+    assert_eq!(cache.bytes(), 0, "dropped source frees its frames from the cache");
+}
