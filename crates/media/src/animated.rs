@@ -1,11 +1,11 @@
-//! Animated images (APNG and animated GIF) as movie clips (#402).
+//! Animated images (APNG, animated GIF, and animated WebP) as movie clips (#402).
 //!
 //! The still decoders read only the first picture of these files. [`open`] decodes every frame
 //! instead, composited onto the full canvas by the `image` crate (APNG blend and dispose operations,
-//! GIF disposal methods), and keeps them with their timing:
+//! GIF and WebP disposal methods), and keeps them with their timing:
 //!
-//! - each frame lasts its own delay; GIF delays of 10 ms or less play as 100 ms and APNG delays
-//!   under 10 ms as 10 ms, as browsers do, so a zero delay never makes a zero-length frame;
+//! - each frame lasts its own delay; GIF delays of 10 ms or less play as 100 ms and APNG and WebP
+//!   delays under 10 ms as 10 ms, as browsers do, so a zero delay never makes a zero-length frame;
 //! - consecutive identical frames are merged (one picture, the sum of their delays);
 //! - the clip is one pass through the animation (the file's loop count is not applied);
 //! - transparency is kept: the source reports alpha when any frame has a pixel that is not fully
@@ -15,12 +15,6 @@
 //! pictures (the clip then ends there), and a frame that fails to decode ends the animation at the
 //! frames decoded before it. A file that turns out not to be animated (one frame, or no frame that
 //! decodes) is left to the still decoders, which is what happened to every animated image before.
-//!
-//! Decoded frames are bounded by a shared [`FrameCache`] under [`ANIMATED_BUDGET`] (#2474).
-//! An [`AnimatedSource`] holds only its timing, format and the file's encoded bytes, not the
-//! decoded RGBA frames. Frames are cached upon first decode and evicted under memory pressure,
-//! decoded again from the beginning of the file on cache misses. Dropping a source frees its
-//! frames from the cache.
 
 use std::io::Cursor;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -38,6 +32,8 @@ use crate::{FrameCache, FrameRequest, MediaError, MediaInfo, MediaKind, MediaSou
 pub const MAX_FRAMES: usize = 10_000;
 /// Most bytes of decoded RGBA pictures kept from one file (after merging identical frames).
 pub const MAX_DECODED_BYTES: usize = 1 << 30;
+/// Most RGBA bytes in one animation canvas while its decoder produces a frame.
+const MAX_DECODED_FRAME_BYTES: usize = 512 << 20;
 
 /// Shared budget of decoded animated image frames (1 GiB, matching GOP cache budget).
 pub const ANIMATED_BUDGET: usize = 1 << 30;
@@ -60,23 +56,29 @@ pub fn budget_bytes() -> usize {
 pub enum Format {
     Apng,
     Gif,
+    WebP,
 }
 
 impl Format {
+    /// Identify an animated image format from its container signature.
     fn sniff(b: &[u8]) -> Option<Format> {
         if b.starts_with(b"\x89PNG\r\n\x1a\n") {
             Some(Format::Apng)
         } else if b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a") {
             Some(Format::Gif)
+        } else if b.get(0..4) == Some(&b"RIFF"[..]) && b.get(8..12) == Some(&b"WEBP"[..]) {
+            Some(Format::WebP)
         } else {
             None
         }
     }
 
+    /// Return the codec label shown in media metadata.
     fn codec(self) -> &'static str {
         match self {
             Format::Apng => "APNG",
             Format::Gif => "GIF",
+            Format::WebP => "WebP",
         }
     }
 
@@ -89,6 +91,7 @@ impl Format {
         let (numer, denom) = match self {
             Format::Gif if ms <= 10 => (100, 1),
             Format::Apng if ms < 10 => (10, 1),
+            Format::WebP if ms < 10 => (10, 1),
             _ => (numer, denom),
         };
         let ticks = numer.saturating_mul(TICKS_PER_SECOND as u128) / denom.saturating_mul(1000);
@@ -97,7 +100,7 @@ impl Format {
 }
 
 /// Helper to open the appropriate decoder stream for `format` and `bytes`.
-fn decode_raw_frames<'a>(format: Format, bytes: &'a [u8]) -> Option<Frames<'a>> {
+fn decode_raw_frames<'a>(name: &str, format: Format, bytes: &'a [u8]) -> Option<Result<Frames<'a>>> {
     match format {
         Format::Apng => {
             let mut d = PngDecoder::new(Cursor::new(bytes)).ok()?;
@@ -105,12 +108,24 @@ fn decode_raw_frames<'a>(format: Format, bytes: &'a [u8]) -> Option<Frames<'a>> 
                 return None;
             }
             d.set_limits(Limits::default()).ok()?;
-            Some(d.apng().ok()?.into_frames())
+            Some(Ok(d.apng().ok()?.into_frames()))
         }
         Format::Gif => {
             let mut d = GifDecoder::new(Cursor::new(bytes)).ok()?;
             d.set_limits(Limits::default()).ok()?;
-            Some(d.into_frames())
+            Some(Ok(d.into_frames()))
+        }
+        Format::WebP => {
+            let mut d = image::codecs::webp::WebPDecoder::new(Cursor::new(bytes)).ok()?;
+            if !d.has_animation() {
+                return None;
+            }
+            let (width, height) = d.dimensions();
+            if rgba_bytes(width, height).is_none_or(|bytes| bytes > MAX_DECODED_FRAME_BYTES) {
+                return Some(Err(MediaError::Unsupported(format!("{name}: animated WebP canvas exceeds the {MAX_DECODED_FRAME_BYTES}-byte frame limit"))));
+            }
+            d.set_limits(Limits::default()).ok()?;
+            Some(Ok(d.into_frames()))
         }
     }
 }
@@ -122,7 +137,7 @@ pub struct AnimatedSource {
     starts: Vec<Tick>,
     /// Unique id for this source in the cache.
     id: u64,
-    /// Format: GIF or APNG.
+    /// Format: GIF, APNG, or WebP.
     format: Format,
     /// The file's encoded bytes, kept to decode evicted frames again.
     bytes: Arc<[u8]>,
@@ -138,7 +153,7 @@ impl Drop for AnimatedSource {
     }
 }
 
-/// Decode `bytes` as an animated image. `None` when it is not an APNG or GIF with at least two
+/// Decode `bytes` as an animated image. `None` when it is not an APNG, GIF, or animated WebP with at least two
 /// frames that decode (the caller then opens it as a still).
 pub fn open(name: &str, bytes: &[u8]) -> Option<Result<AnimatedSource>> {
     from_bytes_with_cache(name, Arc::from(bytes), CACHE.clone())
@@ -152,7 +167,10 @@ pub fn from_bytes(name: &str, bytes: Arc<[u8]>) -> Option<Result<AnimatedSource>
 /// Internal opener that accepts an explicit cache (for testing cache eviction with small budgets).
 pub fn from_bytes_with_cache(name: &str, bytes: Arc<[u8]>, cache: Arc<FrameCache<(u64, usize)>>) -> Option<Result<AnimatedSource>> {
     let format = Format::sniff(&bytes)?;
-    let frames = decode_raw_frames(format, &bytes)?;
+    let frames = match decode_raw_frames(name, format, &bytes)? {
+        Ok(f) => f,
+        Err(e) => return Some(Err(e)),
+    };
     AnimatedSource::from_frames(name, format, bytes.clone(), frames, cache).map(Ok)
 }
 
@@ -162,6 +180,7 @@ impl AnimatedSource {
         let mut last_picture: Option<(u32, u32, Vec<u8>)> = None;
         let mut durations: Vec<Tick> = Vec::new();
         let mut raw_indices: Vec<usize> = Vec::new();
+        let mut decoded_frames = 0usize;
         let mut decoded = 0usize;
         let mut has_alpha = false;
         let mut first_dim: Option<(u32, u32)> = None;
@@ -169,6 +188,7 @@ impl AnimatedSource {
         for (raw_idx, frame) in frames.take(MAX_FRAMES).enumerate() {
             // a damaged frame ends the animation at the frames before it
             let Ok(frame) = frame else { break };
+            decoded_frames = decoded_frames.saturating_add(1);
             let ticks = format.frame_ticks(frame.delay());
             let buffer = frame.into_buffer();
             let (w, h) = buffer.dimensions();
@@ -194,7 +214,7 @@ impl AnimatedSource {
             count += 1;
             last_picture = Some((w, h, rgba));
         }
-        if count < 2 {
+        if count < 2 && !(format == Format::WebP && decoded_frames >= 2) {
             cache.retain(|&(k_id, _)| k_id != id);
             return None;
         }
@@ -259,8 +279,8 @@ impl AnimatedSource {
     fn decode_frame(&self, target_idx: usize) -> Result<Arc<VideoFrame>> {
         let target_raw =
             *self.raw_indices.get(target_idx).ok_or_else(|| MediaError::Decode(format!("{}: frame index {target_idx} out of bounds", self.info.name)))?;
-        let frames = decode_raw_frames(self.format, &self.bytes)
-            .ok_or_else(|| MediaError::Decode(format!("{}: failed to open animated image decoder", self.info.name)))?;
+        let frames = decode_raw_frames(&self.info.name, self.format, &self.bytes)
+            .ok_or_else(|| MediaError::Decode(format!("{}: failed to open animated image decoder", self.info.name)))??;
         let mut current_frame: Option<Arc<VideoFrame>> = None;
         let mut current_merged_idx = 0usize;
         for (raw_idx, frame) in frames.take(MAX_FRAMES).enumerate() {
@@ -285,6 +305,11 @@ impl AnimatedSource {
         }
         current_frame.ok_or_else(|| MediaError::Decode(format!("{}: frame {target_idx} could not be decoded", self.info.name)))
     }
+}
+
+/// Checked byte size of an RGBA8 image.
+fn rgba_bytes(width: u32, height: u32) -> Option<usize> {
+    usize::try_from(width).ok()?.checked_mul(usize::try_from(height).ok()?)?.checked_mul(4)
 }
 
 /// The clip's frame rate: the rate of its most common frame duration, when that is a sensible video
@@ -312,10 +337,12 @@ fn rate_of(durations: &[Tick]) -> FrameRate {
 }
 
 impl MediaSource for AnimatedSource {
+    /// Return the clip's media metadata.
     fn info(&self) -> &MediaInfo {
         &self.info
     }
 
+    /// Return the picture displayed at the requested media time.
     fn video_frame(&self, req: FrameRequest) -> Result<Arc<VideoFrame>> {
         let index = self.index_at(req.time);
         if index >= self.starts.len() {
@@ -324,6 +351,7 @@ impl MediaSource for AnimatedSource {
         self.cache.get_or_insert_with((self.id, index), || self.decode_frame(index))
     }
 
+    /// Animated image files do not provide audio.
     fn audio(&self, _start: i64, _frames: usize, _sample_rate: u32) -> Result<AudioBuffer> {
         Err(MediaError::NoStream("audio"))
     }
