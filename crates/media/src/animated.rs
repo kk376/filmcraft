@@ -358,5 +358,4 @@ impl MediaSource for AnimatedSource {
 }
 
 #[cfg(test)]
-#[path = "animated_tests.rs"]
 mod tests;
